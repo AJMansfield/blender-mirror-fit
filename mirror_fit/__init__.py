@@ -6,13 +6,23 @@ import numpy as np
 import random
 
 
-def flatten(mat):
-    dim = len(mat)
-    return [mat[j][i] for i in range(dim) 
-                      for j in range(dim)]
-def unflatten(mat):
-    dim = int(math.sqrt(len(mat)))
-    return mathutils.Matrix([mat[i*dim:(i+1)*dim] for i in range(dim)])
+def is_mirror(obj):
+    return np.isclose(obj.matrix_world.det(), -1)
+
+def has_mesh_vertices(obj):
+    try:
+        return isinstance(obj.data.vertices, bpy.types.MeshVertices) and len(obj.data.vertices) > 0
+    except AttributeError:
+        return False
+
+class MirrorFitSettings(bpy.types.PropertyGroup):
+    mirror = bpy.props.PointerProperty(type=bpy.types.Object, name="Mirror", description="Object to use as the mirror transformation.", poll=is_mirror)
+    obj = bpy.props.PointerProperty(type=bpy.types.Object, name="Object", description="Object to tune the position of.", poll=has_mesh_vertices)
+    max_dist = bpy.props.FloatProperty(name="Max Distance", description="Ignore matches that are further than this value; 0 to ignore.", default=0, min=0, subtype="DISTANCE")
+    iter_count = bpy.props.IntProperty(name="Iterations", description="Number of iterations to perform when refining the position.", default=20, min=1, soft_max=100, subtype="UNSIGNED")
+    samp_count = bpy.props.IntProperty(name="Samples", description="Number of points to sample to compute the error term; 0 to use all points.", default=20, min=0, soft_max=65536, subtype="UNSIGNED")
+
+
 
 class MirrorErrorEstimatePanel(bpy.types.Panel):
     bl_label = "Mirror Error Estimator"
@@ -81,6 +91,8 @@ class RefineMirrorOperator(bpy.types.Operator):
         obj_size = max(obj.dimensions)
         
         step_factor = 2
+
+        sampled_verts = np.empty(count*3, dtype=np.float64)
         
         
         for i in range(maxiter):
@@ -91,23 +103,13 @@ class RefineMirrorOperator(bpy.types.Operator):
             ang = dist/obj_size
             
             deltas = [
-#                mathutils.Matrix.Rotation(ang, 4, 'X'),
-#                mathutils.Matrix.Rotation(-ang, 4, 'X'),
                 mathutils.Matrix.Rotation(ang, 4, 'Y'),
                 mathutils.Matrix.Rotation(-ang, 4, 'Y'),
                 mathutils.Matrix.Rotation(ang, 4, 'Z'),
                 mathutils.Matrix.Rotation(-ang, 4, 'Z'),
                 mathutils.Matrix.Translation([dist,0,0]),
                 mathutils.Matrix.Translation([-dist,0,0]),
-#                mathutils.Matrix.Translation([0,dist,0]),
-#                mathutils.Matrix.Translation([0,-dist,0]),
-#                mathutils.Matrix.Translation([0,0,dist]),
-#                mathutils.Matrix.Translation([0,0,-dist]),
             ]
-            
-#            print(deltas)
-#            print(dist, ang)
-#            deltas = [ mirror.matrix_world @ d for d in deltas ]
             
             eps_delta = [
                 (compute_error(obj, mirror, d, maxdist=maxdist), d) for d in deltas
@@ -121,10 +123,6 @@ class RefineMirrorOperator(bpy.types.Operator):
                 step_factor /= 2
                 print("worsened: " + str(e))
                 print("Trying smaller step: " + str(step_factor))
-
-#        print("Result: " + str(result_delta))
-        
-#        obj.matrix_world = obj.matrix_world @ result_delta
         
         return {'FINISHED'}
 
@@ -138,16 +136,6 @@ def compute_error(obj, mirror, delta = mathutils.Matrix.Identity(4), maxdist = 1
     
     world_mat = delta @ obj.matrix_world
     obj_mat = world_mat.inverted() 
-#    mirrored_world_mat = mirror.matrix_world @ world_mat
-#    mirrored_obj_mat = world_mat.inverted() @ mirrored_world_mat 
-    
-#    print("mirror.matrix_world", mirror.matrix_world)
-#    print("world_mat", world_mat)
-#    print("obj_mat", obj_mat)
-#    print("mirrored_world_mat", mirrored_world_mat)
-#    print("mirrored_obj_mat", mirrored_obj_mat)
-    
-#    first = True
     
     for v in verts:
         obj_point = v.co
@@ -158,26 +146,9 @@ def compute_error(obj, mirror, delta = mathutils.Matrix.Identity(4), maxdist = 1
         result, closest_obj_point, normal, index = obj.closest_point_on_mesh(mirror_obj_point, distance=maxdist)
         
         if result:
-#            closest_world_point = world_mat @ closest_obj_point
-            
-#            if first:
-#                print("obj_point", obj_point)
-#                print("world_point", world_point)
-#                print("mirror_world_point", mirror_world_point)
-#                print("mirror_obj_point", mirror_obj_point)
-#                print("closest_obj_point", closest_obj_point)
-#                print("closest_world_point", closest_world_point)
-#                first = False
-            
             obj_d = (mirror_obj_point - closest_obj_point)
-#            world_d = (mirror_world_point - closest_world_point)
             obj_err += obj_d.dot(obj_d)
-#            world_err += world_d.dot(world_d)
             count += 1
-        else:
-#            print("obj point:", v.co)
-#            print("mirrored:", mirrored_obj_mat @ v.co)
-            pass
     
     if count == 0:
         return float('inf')
@@ -189,9 +160,9 @@ def register():
     bpy.utils.register_class(MirrorErrorEstimatePanel)
     bpy.utils.register_class(RefineMirrorOperator)
     bpy.utils.register_class(SetTransformFromMirrorObjectOperator)
-    bpy.types.Scene.my_mirror = bpy.props.PointerProperty(type=bpy.types.Object, name="Mirror")
-    bpy.types.Scene.my_obj = bpy.props.PointerProperty(type=bpy.types.Object, name="Object")
-    bpy.types.Scene.my_maxdist = bpy.props.FloatProperty(name="dist")
+    bpy.types.Scene.mirror_mirror = bpy.props.PointerProperty(type=bpy.types.Object, name="Mirror")
+    bpy.types.Scene.mirror_obj = bpy.props.PointerProperty(type=bpy.types.Object, name="Object")
+    bpy.types.Scene.mirror_maxdist = bpy.props.FloatProperty(name="dist")
     bpy.types.Scene.my_maxiter = bpy.props.IntProperty(name="maxiter")
     bpy.types.Scene.my_transform = bpy.props.FloatVectorProperty(name="Matrix", size=16, subtype="MATRIX")
 
