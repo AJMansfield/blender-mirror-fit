@@ -1,4 +1,4 @@
-from argparse import ArgumentError
+import math
 import bpy
 import mathutils
 import numpy as np
@@ -18,7 +18,7 @@ def is_good_mirror(mirror: bpy.types.Object) -> bool:
 
 def _get_object_and_mirror(context: bpy.types.Context) -> tuple[bpy.types.Object, bpy.types.Object]:
     """returns (object, mirror)"""
-    if not len(context.selected_objects) == 2: raise ArgumentError("Must have two selected objects.")
+    if not len(context.selected_objects) == 2: raise ValueError("Must have two selected objects.")
     a,b = tuple(context.selected_objects)
 
     # if one of them is an empty, it's definitely the mirror
@@ -50,11 +50,11 @@ def _get_object_and_mirror(context: bpy.types.Context) -> tuple[bpy.types.Object
 
 def get_object_and_mirror(context: bpy.types.Context) -> tuple[bpy.types.Object, bpy.types.Object]:
     """picks out the object and the mirror to manipulate from the current selected objects, and validates them"""
-    obj, mirror = cls._get_object_and_mirror(context)
+    obj, mirror = _get_object_and_mirror(context)
     if not is_good_obj(obj):
-        raise ArgumentError("Active Object must contain a mesh.")
+        raise ValueError("Active Object must contain a mesh.")
     if not is_good_mirror(mirror):
-        raise ArgumentError("Mirror must be empty or have a mesh with a single polygon.")
+        raise ValueError("Mirror must be empty or have a mesh with a single polygon.")
     return obj, mirror
 
 def get_mirror_normal(mirror: bpy.types.Object) -> mathutils.Vector:
@@ -86,6 +86,15 @@ def get_mirror_matrix(mirror: bpy.types.Object) -> mathutils.Matrix:
     reflection = mathutils.Matrix.Scale(-1, 4, norm)
     return translation @ reflection @ translation.inverted()
 
+def np_array_from_vertices(vertices: bpy.types.MeshVertices) -> np.ndarray:
+    vlen = len(vertices)
+    vco = np.empty(vlen * 3)
+    vertices.foreach_get('co', vco)
+    coords = np.empty((vlen, 4))
+    coords[::4] = 1.0
+    coords[:,:-1] = vco.reshape((vlen, 3))
+    return coords
+
 class Mirror:
     def __init__(self, mirror_object: bpy.types.Object):
         self.mirror = mirror_object
@@ -104,22 +113,22 @@ class Mirror:
         self.matrix_reflect = self.mirror.matrix_world @ get_mirror_matrix(self.mirror) @ self.mirror.matrix_world.inverted()
         """Matrix representing this mirror's reflection transformation in world-space coordinates."""
 
-    def make_delta_distance(self, obj, dist):
+    def make_delta_distance(self, obj: bpy.types.Object, dist: float):
         v = obj.matrix_world.inverted() @ self.t_axis # transform translation axis into object space
         v.normalize() # normalize and multiply by distance to get it in object-space units
         v *= dist
         return mathutils.Matrix.Translation(v)
 
-    def make_delta_rotation(self, obj, ang, axis):
+    def make_delta_rotation(self, obj: bpy.types.Object, ang: float, axis: mathutils.Vector):
         r1 = mathutils.Matrix.Rotation(ang, 4, axis) # rotation in world-space coordinates
         r2 = obj.matrix_world.inverted() @ r1 @ obj.matrix_world # transform into object-space coordinates
         r3 = r2.to_quaternion().to_matrix().to_4x4() # drop all but rotational component to rotate about object origin rather than world origin
         return r3
 
-    def make_reflection(self, obj):
+    def make_reflection(self, obj: bpy.types.Object):
         return obj.matrix_world.inverted() @ self.matrix_reflect @ obj.matrix_world
     
-    def make_deltas(self, obj, avg_error, speed):
+    def make_deltas(self, obj: bpy.types.Object, avg_error: float, speed: float):
         radius = max(obj.dimensions)
         dist = np.sqrt(avg_error) * speed
         angle = dist / radius
@@ -127,11 +136,21 @@ class Mirror:
         return [
             self.make_delta_distance(obj, dist),
             self.make_delta_distance(obj, -dist),
-            self.make_delta_rotation(obj, self.r1_axis, angle),
-            self.make_delta_rotation(obj, self.r1_axis, -angle),
-            self.make_delta_rotation(obj, self.r2_axis, angle),
-            self.make_delta_rotation(obj, self.r2_axis, -angle),
+            self.make_delta_rotation(obj, angle, self.r1_axis),
+            self.make_delta_rotation(obj, -angle, self.r1_axis),
+            self.make_delta_rotation(obj, angle, self.r2_axis),
+            self.make_delta_rotation(obj, -angle, self.r2_axis),
         ]
+    
+    delta_names = [
+        "+T",
+        "-T",
+        "+A",
+        "-A",
+        "+B",
+        "-B",
+    ]
+
 
 class OBJECT_OT_mirror_fit(bpy.types.Operator):
     """Tweak object trasform to minimize mirroring error."""
@@ -141,8 +160,8 @@ class OBJECT_OT_mirror_fit(bpy.types.Operator):
     
     # mirror: bpy.props.PointerProperty(type=bpy.types.Object, name="Mirror", description="Object to use as the mirror transformation.")
     max_dist: bpy.props.FloatProperty(name="Max Distance", description="Ignore matches that are further than this value.", default=1.84467e+19, min=sys.float_info.min, subtype="DISTANCE", unit="LENGTH")
-    iter_count: bpy.props.IntProperty(name="Iterations", description="Number of iterations to perform when refining the position.", default=20, min=1, soft_max=100, subtype="UNSIGNED")
-    samp_count: bpy.props.IntProperty(name="Samples", description="Number of points to sample to compute the error term; 0 to use all points.", default=20, min=0, soft_max=65536, subtype="UNSIGNED")
+    iter_count: bpy.props.IntProperty(name="Iterations", description="Number of iterations to perform when refining the position.", default=100, min=1, soft_max=100, subtype="UNSIGNED")
+    samp_count: bpy.props.IntProperty(name="Samples", description="Number of points to sample to compute the error term; 0 to use all points.", default=1024, min=0, soft_max=65536, subtype="UNSIGNED")
     samp_seed: bpy.props.IntProperty(name="Random Seed", description="Seed for sampling points.", default=0)
     speed: bpy.props.FloatProperty(name="Step Factor", description="Scaling factor for gradients.", default=1, min=sys.float_info.min, soft_min=1, soft_max=1)
 
@@ -160,12 +179,9 @@ class OBJECT_OT_mirror_fit(bpy.types.Operator):
 
         me = obj.data
         assert isinstance(me, bpy.types.Mesh)
+        verts = np_array_from_vertices(me.vertices)
 
-        verts = np.empty(len(me.vertices)*3, dtype=np.float64)
-        me.vertices.foreach_get('co', verts) # fastest way to get vertices in a numpy array
-        verts.shape = (len(me.vertices), 3) 
-
-        if self.samp_count > 0:
+        if self.samp_count > 0 and self.samp_count < len(verts):
             rng = np.random.default_rng(self.samp_seed)
             sample = rng.choice(verts, self.samp_count)
         else:
@@ -177,33 +193,53 @@ class OBJECT_OT_mirror_fit(bpy.types.Operator):
             dm = obj.matrix_world @ delta
             return dm.inverted() @ mirror.matrix_reflect @ dm
 
-        avg_error = self.calculate_error(matrix_total() @ sample, obj)
-        print("error starting:", avg_error)
+        # the `matrix_total() @ sample` product is one of the most computationally intense things we're doing here
+        # we would normally write the matrix sample product as matrix @ sample, but due to the data layout, sample is actually (n,4) rather than (4,n)
+        # therefore we transform it as sample @ matrix.T
+
+        cpv = self.make_closest_point_vectorized(obj, self.max_dist)
+        avg_error = self.calculate_error(sample @ np.array(matrix_total()).T, cpv)
+        print("  ", "error starting:", avg_error)
         
         for i in range(self.iter_count):
-            err_delta = [
-                (
-                    self.calculate_error(matrix_total(delta=d) @ sample, obj), d
-                ) for d in mirror.make_deltas(obj, avg_error, self.speed)
-            ]
+            deltas = mirror.make_deltas(obj, avg_error, self.speed)
+            errors = [self.calculate_error(sample @ np.array(matrix_total(delta=d)).T, cpv) for d in deltas]
+            i = np.argmin(errors)
             
-            new_error, delta = min(err_delta)
+            new_error = errors[i]
+            delta = deltas[i]
+            step_name = mirror.delta_names[i]
+
             if new_error < avg_error:
                 avg_error = new_error
-                print("error accepted:", avg_error)
+                print(step_name, "error accepted:", avg_error)
                 obj.matrix_world = obj.matrix_world @ delta
+                cpv = self.make_closest_point_vectorized(obj, self.max_dist)
             else:
                 self.speed /= 2
-                print("error rejected:", new_error)
-                print("reduced speed to:" + str(self.speed))
+                print(step_name, "error rejected:", new_error)
+                print("reduced speed to:", self.speed)
+                if np.isclose(self.speed, 0): break
         
         return {'FINISHED'}
-    
+
+    @staticmethod
+    def make_closest_point_vectorized(obj, distance):
+        nan4 = np.ones(4) * np.NaN
+        def closest_point(point):
+            result, closest, normal, index = obj.closest_point_on_mesh(point[:-1], distance=distance)
+            if not result:
+                return nan4
+            else:
+                return np.array(closest.to_4d())
+        return np.vectorize(closest_point, signature='(4)->(4)')
 
         
-    def calculate_error(self, points, obj):
-        error = 0
-        count = 0
+    def calculate_error(self, points, closest_point_vectorized):
+        closest_points = closest_point_vectorized(points)
+        error_vec = points - closest_points
+        error_values = np.linalg.norm(error_vec, axis=0)
+        return np.nanmean(error_values)
 
         for point in points:
             result, closest_point, normal, index = obj.closest_point_on_mesh(point, distance=self.max_dist)
