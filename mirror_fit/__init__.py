@@ -1,8 +1,9 @@
-import math
+from ast import arg
 import bpy
 import mathutils
 import numpy as np
 import sys
+import scipy.optimize
 
 # bl_info = {
 #     "name": "Fit to Mirror",
@@ -88,9 +89,9 @@ def get_mirror_matrix(mirror: bpy.types.Object) -> mathutils.Matrix:
 
 def np_array_from_vertices(vertices: bpy.types.MeshVertices) -> np.ndarray:
     vlen = len(vertices)
-    vco = np.empty(vlen * 3)
+    vco = np.empty(vlen * 3, dtype=np.float32)
     vertices.foreach_get('co', vco)
-    coords = np.empty((vlen, 4))
+    coords = np.empty((vlen, 4), dtype=np.float32)
     coords[::4] = 1.0
     coords[:,:-1] = vco.reshape((vlen, 3))
     return coords
@@ -131,7 +132,7 @@ class Mirror:
     def make_deltas(self, obj: bpy.types.Object, avg_error: float, speed: float):
         radius = max(obj.dimensions)
         dist = np.sqrt(avg_error) * speed
-        angle = dist / radius
+        angle = dist / radius * 2
 
         return [
             self.make_delta_distance(obj, dist),
@@ -191,19 +192,51 @@ class OBJECT_OT_mirror_fit(bpy.types.Operator):
 
         def matrix_total(delta = mathutils.Matrix.Identity(4)):
             dm = obj.matrix_world @ delta
-            return dm.inverted() @ mirror.matrix_reflect @ dm
+            return np.array(dm.inverted() @ mirror.matrix_reflect @ dm, dtype=np.float32).T
 
         # the `matrix_total() @ sample` product is one of the most computationally intense things we're doing here
         # we would normally write the matrix sample product as matrix @ sample, but due to the data layout, sample is actually (n,4) rather than (4,n)
         # therefore we transform it as sample @ matrix.T
 
         cpv = self.make_closest_point_vectorized(obj, self.max_dist)
-        avg_error = self.calculate_error(sample @ np.array(matrix_total()).T, cpv)
-        print("  ", "error starting:", avg_error)
+        avg_error = self.calculate_error(sample @ matrix_total(), cpv)
+        print("  ", " error initial:", avg_error)
         
+        # instead of stepping manually, parameterize the space and use a canned numerical optimization routine
+        # Parameters are r, a, b; corresponding to the transformation make_delta_rotation(obj, b, r2_axis) @ make_delta_rotation(obj, a, r1_axis) @ make_delta_distance(obj, r)
+
+        # def fun(arguments: np.ndarray) -> np.float32:
+        #     # x,a,b = tuple(arguments)
+        #     # delta = mirror.make_delta_rotation(obj, b, mirror.r2_axis) @ mirror.make_delta_rotation(obj, a, mirror.r1_axis) @ mirror.make_delta_distance(obj, x)
+        #     arg = mathutils.Matrix(arguments.reshape((4,4)))
+        #     delta = mathutils.Matrix.LocRotScale(arg.to_translation(), arg.to_quaternion(), mathutils.Vector([1,1,1]))
+        #     sample_transformed = sample @ np.array(matrix_total(delta), dtype=np.float32).T
+        #     result = self.calculate_residuals(sample_transformed, cpv)
+        #     result[np.isnan(result)] = 1000000
+        #     return result
+
+        # x0 = np.eye(4, dtype=np.float32).flatten()
+
+        # print("fun(x0) =", fun(x0))
+        
+        # result = scipy.optimize.least_squares(
+        #     fun,
+        #     x0,
+        #     # bounds=np.array([[-np.inf, np.inf], [-np.pi/2, np.pi/2], [-np.pi/2, np.pi/2]], dtype=np.float32).T,
+        #     max_nfev=self.iter_count,
+        #     verbose=2,
+        #     # diff_step=initial_error,
+        #     # options={'maxiter': self.iter_count, 'disp': True},
+        # )
+        
+        # arg = mathutils.Matrix(result.x.reshape((4,4)))
+        # delta = mathutils.Matrix.LocRotScale(arg.to_translation(), arg.to_quaternion(), mathutils.Vector([1,1,1]))
+
+        # obj.matrix_world = obj.matrix_world @ delta
+
         for i in range(self.iter_count):
             deltas = mirror.make_deltas(obj, avg_error, self.speed)
-            errors = [self.calculate_error(sample @ np.array(matrix_total(delta=d)).T, cpv) for d in deltas]
+            errors = [self.calculate_error(sample @ matrix_total(delta=d), cpv) for d in deltas]
             i = np.argmin(errors)
             
             new_error = errors[i]
@@ -224,21 +257,34 @@ class OBJECT_OT_mirror_fit(bpy.types.Operator):
         return {'FINISHED'}
 
     @staticmethod
-    def make_closest_point_vectorized(obj, distance):
+    def make_closest_point_vectorized(obj: bpy.types.Object, distance: float):
+        # just ignoring distance
         nan4 = np.ones(4) * np.NaN
         def closest_point(point):
             result, closest, normal, index = obj.closest_point_on_mesh(point[:-1], distance=distance)
             if not result:
                 return nan4
             else:
-                return np.array(closest.to_4d())
+                return np.array(closest.to_4d(), dtype=np.float32)
         return np.vectorize(closest_point, signature='(4)->(4)')
 
         
-    def calculate_error(self, points, closest_point_vectorized):
+    def calculate_residuals(self, points, closest_point_vectorized):
+        # print("points =", points)
         closest_points = closest_point_vectorized(points)
+        # print("closest_points =", closest_points)
         error_vec = points - closest_points
-        error_values = np.linalg.norm(error_vec, axis=0)
+        error_values = np.linalg.norm(error_vec, axis=1)
+        return error_values
+        
+    def calculate_error(self, points, closest_point_vectorized):
+        # print("points =", points)
+        closest_points = closest_point_vectorized(points)
+        # print("closest_points =", closest_points)
+        error_vec = points - closest_points
+        # print("error_vec =", error_vec)
+        error_values = np.linalg.norm(error_vec, axis=1)
+        # print("error_values =", error_values)
         return np.nanmean(error_values)
 
         for point in points:
